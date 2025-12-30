@@ -336,9 +336,17 @@ class UninstallPathSet:
             self._refuse.add(path)
 
         # __pycache__ files can show up after 'installed-files.txt' is created,
-        # due to imports
-        if os.path.splitext(path)[1] == ".py":
-            self.add(cache_from_source(path))
+        # due to imports. Add cached files if the implementation uses a cache.
+        if (
+            os.path.splitext(path)[1] == ".py"
+            and sys.implementation.cache_tag is not None
+        ):
+            # PEP-488 (https://peps.python.org/pep-0488/) documents the standard
+            # optimization levels: "" = no optimization, 1 = -O, and 2 = -OO.
+            # There is no import available to query these values or the levels
+            # introduced by a third party so only remove the standard levels.
+            for opt in ("", 1, 2):
+                self.add(cache_from_source(path, optimization=opt))
 
     def add_pth(self, pth_file: str, entry: str) -> None:
         pth_file = self._normalize_path_cached(pth_file)
