@@ -112,32 +112,74 @@ def compress_for_rename(paths: Iterable[str]) -> set[str]:
     This set may include directories when the original sequence of paths
     included every file on disk.
     """
-    case_map = {os.path.normcase(p): p for p in paths}
-    remaining = set(case_map)
-    unchecked = sorted({os.path.split(p)[0] for p in case_map.values()}, key=len)
-    wildcards: set[str] = set()
+
+    # Map of normcase string used for comparison to displayable value
+    # Note: the paths passed into this function are generally already in normcase
+    case_map: dict[str, str] = {}
+
+    # Map of normcase to display string wildcards
+    wildcards: dict[str, str] = {}
+
+    # Immediately add directories from `paths` to the list of wildcards
+    # We do _not_ add the files within wildcard paths
+    for path in sorted(paths, key=len):
+        if os.path.isdir(path) and not os.path.islink(path):
+            wild = os.path.join(path, "")
+            wildcards[os.path.normcase(wild)] = wild
+        else:
+            # pruning here means no need to rely on `compact` to drop these
+            if not any(os.path.normcase(path).startswith(w) for w in wildcards.keys()):
+                case_map[os.path.normcase(path)] = path
+
+    # The normcase list of paths (files/symlinks, not dirs) not in wildcard paths
+    remaining = set(case_map.keys())
+
+    processed_subdirs: set[str] = set()
 
     def norm_join(*a: str) -> str:
         return os.path.normcase(os.path.join(*a))
 
+    # This selects the parent directory of the files in the list so we can check
+    # for adjacent/sibling files to know if we have to remove files individually
+    # or if we can remove them via a wildcard. For example, pyc files may not be
+    # in a RECORD but should be removed via the __pycache__ wildcard.
+    unchecked = sorted({os.path.dirname(p) for p in case_map.values()}, key=len)
+
     for root in unchecked:
-        if any(os.path.normcase(root).startswith(w) for w in wildcards):
+        normcase_root = os.path.normcase(root)
+
+        # Skip wildcards and subdirectories we've already seen
+        # These aren't the dirs we're looking for...
+        if any(
+            normcase_root.startswith(w) for w in processed_subdirs | wildcards.keys()
+        ):
             # This directory has already been handled.
             continue
 
         all_files: set[str] = set()
-        all_subdirs: set[str] = set()
+
         for dirname, subdirs, files in os.walk(root):
-            all_subdirs.update(norm_join(root, dirname, d) for d in subdirs)
+            # The returned case when walking the directory may be inconsistent
+            # with our expectations and lead to comparison failures if paths had
+            # been normcased before being passed into this function so we normcase
+            # to avoid potential mismatches.
+            # We explicitly exclude paths that are in the wildcard list since the
+            # files they contain do not create conflict when calculating "all_files"
+            # within this directory
+            subdirs[:] = [
+                d for d in subdirs if norm_join(dirname, d, "") not in wildcards.keys()
+            ]
+            processed_subdirs.add(norm_join(root, dirname, ""))
             all_files.update(norm_join(root, dirname, f) for f in files)
         # If all the files we found are in our remaining set of files to
         # remove, then remove them from the latter set and add a wildcard
         # for the directory.
         if not (all_files - remaining):
             remaining.difference_update(all_files)
-            wildcards.add(root + os.sep)
+            wildcards[normcase_root + os.path.sep] = root + os.path.sep
 
-    return set(map(case_map.__getitem__, remaining)) | wildcards
+    # TODO: determine if we should compact the wildcards here
+    return set(map(case_map.__getitem__, remaining)) | set(wildcards.values())
 
 
 def compress_for_output_listing(paths: Iterable[str]) -> tuple[set[str], set[str]]:
@@ -166,12 +208,24 @@ def compress_for_output_listing(paths: Iterable[str]) -> tuple[set[str], set[str
 
     _normcased_files = set(map(os.path.normcase, files))
 
+    _scheduled_dirs = {
+        os.path.normcase(p)
+        for p in will_remove
+        if os.path.isdir(p) and not os.path.islink(p)
+    }
+
     folders = compact(folders)
 
     # This walks the tree using os.walk to not miss extra folders
     # that might get added.
     for folder in folders:
-        for dirpath, _, dirfiles in os.walk(folder):
+        for dirpath, subdirs, dirfiles in os.walk(folder):
+            subdirs[:] = [
+                d
+                for d in subdirs
+                if os.path.normcase(os.path.join(dirpath, d)) not in _scheduled_dirs
+            ]
+
             for fname in dirfiles:
                 if fname.endswith(".pyc"):
                     continue
