@@ -113,22 +113,42 @@ def compress_for_rename(paths: Iterable[str]) -> set[str]:
     This set may include directories when the original sequence of paths
     included every file on disk.
     """
-    case_map = {os.path.normcase(p): p for p in paths}
-    remaining = set(case_map)
-    unchecked = sorted({os.path.join(os.path.dirname(p), "") for p in case_map.values()}, key=len)
+    case_map: dict[str, str] = {}
+    remaining: set[str] = set()
+    unchecked: set[str] = set()
     wildcards: dict[str, str] = {}
 
     def norm_join(*a: str) -> str:
         return os.path.normcase(os.path.join(*a))
 
-    for root in unchecked:
+    # Immediately add directories from `paths` to the list of wildcards
+    for path in sorted(paths, key=len):
+        norm_path = os.path.normcase(path)
+
+        if any(norm_path.startswith(w) for w in wildcards):
+            continue
+
+        if os.path.isdir(path) and not os.path.islink(path):
+            wildcards[os.path.join(norm_path, "")] = os.path.join(path, "")
+        # We do _not_ add the files within wildcard paths. Pruning here means
+        # no need to rely on `compact` to drop files covered by a wildcard
+        else:
+            case_map[norm_path] = path
+            remaining.add(norm_path)
+            # unchecked -> root -> wildcard so must be display case
+            unchecked.add(os.path.join(os.path.dirname(path), ""))
+
+    for root in sorted(unchecked, key=len):
         norm_root = os.path.normcase(root)
         if any(norm_root.startswith(w) for w in wildcards):
             # This directory has already been handled.
             continue
 
         all_files: set[str] = set()
-        for dirname, _, files in os.walk(root):
+        for dirname, subdirs, files in os.walk(root):
+            subdirs[:] = [
+                d for d in subdirs if norm_join(dirname, d, "") not in wildcards
+            ]
             all_files.update(norm_join(dirname, f) for f in files)
         # If all the files we found are in our remaining set of files to
         # remove, then remove them from the latter set and add a wildcard
