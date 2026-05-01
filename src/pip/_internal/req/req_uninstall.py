@@ -112,10 +112,27 @@ def compress_for_rename(paths: Iterable[str]) -> set[str]:
     This set may include directories when the original sequence of paths
     included every file on disk.
     """
-    case_map = {os.path.normcase(p): p for p in paths}
-    remaining = set(case_map)
-    unchecked = sorted({os.path.split(p)[0] for p in case_map.values()}, key=len)
+
+    case_map: dict[str, str] = {}
+
+    # Map of normcase to display string wildcards
     wildcards: set[str] = set()
+
+    # Immediately add directories from `paths` to the list of wildcards
+    # We do _not_ add the files within wildcard paths
+    for path in sorted(paths, key=len):
+        if os.path.isdir(path) and not os.path.islink(path):
+            wild = os.path.join(path, "")
+            wildcards.add(wild)
+        else:
+            # pruning here means no need to rely on `compact` to drop these
+            if not any(os.path.normcase(path).startswith(w) for w in wildcards):
+                case_map[os.path.normcase(path)] = path
+
+    # The normcase list of paths (files/symlinks, not dirs) not in wildcard paths
+    remaining = set(case_map.keys())
+
+    unchecked = sorted({os.path.split(p)[0] for p in case_map.values()}, key=len)
 
     def norm_join(*a: str) -> str:
         return os.path.normcase(os.path.join(*a))
@@ -128,6 +145,9 @@ def compress_for_rename(paths: Iterable[str]) -> set[str]:
         all_files: set[str] = set()
         all_subdirs: set[str] = set()
         for dirname, subdirs, files in os.walk(root):
+            subdirs[:] = [
+                d for d in subdirs if norm_join(dirname, d, "") not in wildcards
+            ]
             all_subdirs.update(norm_join(root, dirname, d) for d in subdirs)
             all_files.update(norm_join(root, dirname, f) for f in files)
         # If all the files we found are in our remaining set of files to
