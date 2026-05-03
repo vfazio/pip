@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import os
+import stat
 import sys
 import sysconfig
 from collections.abc import Callable, Generator, Iterable
@@ -112,59 +113,194 @@ def compress_for_rename(paths: Iterable[str]) -> set[str]:
 
     This set may include directories when the original sequence of paths
     included every file on disk.
+
+    Note that since we do not control the input into this function, we do things
+    like checking for os.sep in case external logic ever changes.
     """
     case_map: dict[str, str] = {}
     remaining: set[str] = set()
-    unchecked: set[str] = set()
     wildcards: dict[str, str] = {}
 
     def norm_join(*a: str) -> str:
         return os.path.normcase(os.path.join(*a))
 
-    # Immediately add directories from `paths` to the list of wildcards
+    # Map normalized roots to their original casing
+    potential_roots: dict[str, str] = {}
+    covered_cache: dict[str, bool] = {}
+
     for path in sorted(paths, key=len):
         norm_path = os.path.normcase(path)
+        norm_dir = os.path.dirname(norm_path)
 
         # We do _not_ add the files within wildcard paths.
-        if any(norm_path.startswith(w) for w in wildcards):
+        # To speed up whether a file is within a wildcard, we break the
+        # path up into components and cache the answer so other files can
+        # take advantage of the lookup.
+        is_covered = covered_cache.get(norm_dir)
+        if is_covered is None:
+            # Only do the expensive walk if the cache misses
+            curr = norm_dir
+            is_covered = False
+            while curr:
+                w_key = curr if curr.endswith(os.sep) else curr + os.sep
+                if w_key in wildcards:
+                    is_covered = True
+                    break
+                parent = os.path.dirname(curr)
+                if parent == curr:
+                    break
+                curr = parent
+            covered_cache[norm_dir] = is_covered
+
+        if is_covered:
             continue
 
-        if os.path.isdir(path) and not os.path.islink(path):
-            wildcards[os.path.join(norm_path, "")] = os.path.join(path, "")
-        else:
-            case_map[norm_path] = path
-            remaining.add(norm_path)
-            # unchecked -> root -> wildcard so must be display case
-            # ensure it's terminated so it can match against wildcards
-            unchecked.add(os.path.join(os.path.dirname(path), ""))
-
-    # Note: we start at the highest level directory. We do _not_ collapse common
-    # roots (/A/B/C is not elided if /A/B is in the set) because with the current
-    # logic we must descend into the children to determine if _they_ can become
-    # wildcards even if the  parent cannot. This is why we also cannot keep a set
-    # of visited descendants since the wildcard is calculated for the root. This
-    # means that we evaluate the same subdirectory multiple times.
-
-    for root in sorted(unchecked, key=len):
-        norm_root = os.path.normcase(root)
-        if any(norm_root.startswith(w) for w in wildcards):
-            # This directory has already been handled.
+        try:
+            if stat.S_ISDIR(os.stat(path, follow_symlinks=False).st_mode):
+                w_key = norm_path if norm_path.endswith(os.sep) else norm_path + os.sep
+                w_orig = path if path.endswith(os.sep) else path + os.sep
+                wildcards[w_key] = w_orig
+                covered_cache[norm_path] = True
+                continue
+        except OSError:
             continue
 
-        all_files: set[str] = set()
-        for dirname, subdirs, files in os.walk(root):
-            subdirs[:] = [
-                d for d in subdirs if norm_join(dirname, d, "") not in wildcards
-            ]
-            all_files.update(norm_join(dirname, f) for f in files)
-        # If all the files we found are in our remaining set of files to
-        # remove, then remove them from the latter set and add a wildcard
-        # for the directory.
-        if not (all_files - remaining):
-            remaining.difference_update(all_files)
-            wildcards[norm_root] = root
+        case_map[norm_path] = path
+        remaining.add(norm_path)
+        p_dir_norm = norm_dir if norm_dir.endswith(os.sep) else norm_dir + os.sep
+        if p_dir_norm not in potential_roots:
+            orig_dir = os.path.dirname(path)
+            p_dir_orig = orig_dir if orig_dir.endswith(os.sep) else orig_dir + os.sep
+            potential_roots[p_dir_norm] = p_dir_orig
 
-    return set(map(case_map.__getitem__, remaining)) | set(wildcards.values())
+    # Outside of the initial pass, all data should be in a known format
+
+    # We want to identify the top most unique candidate directories so that we
+    # only process a directory and its children once
+    roots: list[str] = []
+    for candidate in sorted(potential_roots, key=len):
+        if not any(candidate.startswith(os.path.normcase(r)) for r in roots):
+            roots.append(potential_roots[candidate])
+
+    # a list of all directories we may own
+    owned_paths: set[str] = set()
+    for rs_norm in potential_roots:
+        for r_orig in roots:
+            r_norm = os.path.normcase(r_orig)
+
+            if rs_norm.startswith(r_norm):
+                # Calculate the lineage segments
+                tail = rs_norm[len(r_norm) :]
+
+                current = r_norm
+                owned_paths.add(current)
+
+                if tail:
+                    parts = [p for p in tail.split(os.sep) if p]
+                    for part in parts:
+                        current = current + part + os.sep
+                        owned_paths.add(current)
+                break
+
+    def process_directory(real_dir: str) -> bool:
+        """
+        Returns True if the directory is perfectly clean.
+        Reads the disk exactly once per valid directory.
+
+        real_dir should generally not be in normcase for purposes of fidelity
+        """
+        norm_dir = norm_join(real_dir, "")
+
+        if norm_dir in wildcards:
+            return True
+
+        try:
+            with os.scandir(real_dir) as it:
+                entries = list(it)
+        except OSError:
+            return False
+
+        poisoned = False
+        local_files = set()
+
+        for entry in entries:
+            norm_entry = os.path.normcase(entry.path)
+
+            if entry.is_dir(follow_symlinks=False):
+                _dir = norm_entry + os.sep
+
+                # is the dir in our wildcards?
+                if _dir in wildcards:
+                    continue
+
+                # Is the path out of bounds? A possible scenario is a sibling
+                # directory for a namespace package not owned by the distribution
+                # being uninstalled. If so, we cannot wildcard the current
+                # directory and we do not need to process files in that path.
+                # We must continue processing this path for files we may still own
+                #
+                # Note: Even if the candidate dir is empty, we do _not_ remove it.
+                # To do so would require processing the directory and for it to be
+                # clean (not poisoned), we could then possibly clean up the dir.
+                #
+                # The packaging guidelines say:
+                #   Directories should not be listed.
+                # and
+                #   To completely uninstall a package, a tool needs to remove all
+                #   files listed in RECORD, all .pyc files (of all optimization
+                #   levels) corresponding to removed .py files, _and any directories
+                #   emptied by the uninstallation_.
+                # See:
+                #   https://packaging.python.org/en/latest/specifications/recording-installed-packages/#the-record-file
+                #
+                # Since this RECORD did not own that directory, and should != shall,
+                # meaning some package could have made that empty path, we're
+                # following the guidance to the letter.
+                # If we change our mind:
+                #   poisoned = not process_directory(entry.path)
+                if _dir not in owned_paths:
+                    poisoned = True
+                    continue
+
+                # if the descendant is not wholly captured by the file list and
+                # thus a wildcard, then we cannot be a wildcard either.
+                if not process_directory(entry.path):
+                    poisoned = True
+            else:
+                # We've identified a file in the current directory and have no directive
+                # to claim is as our own (wildcard or discrete entry in remaining)
+                if norm_entry in remaining:
+                    local_files.add(norm_entry)
+                else:
+                    poisoned = True
+
+        if poisoned:
+            return False
+
+        # If we claim ownership of all physical files/subdirectories via wildcards
+        # or entries in the file list, then we are a wildcard and can remove all
+        # entries matching our prefix.
+        wildcards[norm_dir] = os.path.join(real_dir, "")
+        remaining.difference_update(local_files)
+        # This covers the case where a file is in the file list but not on disk and
+        # we never iterated on it. Remove so there are no rogue entries in `remaining`.
+        # We could improve this with a mapping of parent path to files
+        remaining.difference_update({f for f in remaining if f.startswith(norm_dir)})
+        return True
+
+    # Process the top level roots we identified
+    for root in roots:
+        process_directory(root)
+
+    # Because a child adds itself to wildcards before its parent does,
+    # we need to filter out the children if the parent ultimately succeeded.
+    final_wildcards: set[str] = set()
+    for w in sorted(wildcards, key=len):
+        orig_w = wildcards[w]
+        if not any(w.startswith(os.path.normcase(fw)) for fw in final_wildcards):
+            final_wildcards.add(orig_w)
+
+    return {case_map[p] for p in remaining} | final_wildcards
 
 
 def compress_for_output_listing(paths: Iterable[str]) -> tuple[set[str], set[str]]:
