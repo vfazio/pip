@@ -125,18 +125,25 @@ def compress_for_rename(paths: Iterable[str]) -> set[str]:
     for path in sorted(paths, key=len):
         norm_path = os.path.normcase(path)
 
+        # We do _not_ add the files within wildcard paths.
         if any(norm_path.startswith(w) for w in wildcards):
             continue
 
         if os.path.isdir(path) and not os.path.islink(path):
             wildcards[os.path.join(norm_path, "")] = os.path.join(path, "")
-        # We do _not_ add the files within wildcard paths. Pruning here means
-        # no need to rely on `compact` to drop files covered by a wildcard
         else:
             case_map[norm_path] = path
             remaining.add(norm_path)
             # unchecked -> root -> wildcard so must be display case
+            # ensure it's terminated so it can match against wildcards
             unchecked.add(os.path.join(os.path.dirname(path), ""))
+
+    # Note: we start at the highest level directory. We do _not_ collapse common
+    # roots (/A/B/C is not elided if /A/B is in the set) because with the current
+    # logic we must descend into the children to determine if _they_ can become
+    # wildcards even if the  parent cannot. This is why we also cannot keep a set
+    # of visited descendants since the wildcard is calculated for the root. This
+    # means that we evaluate the same subdirectory multiple times.
 
     for root in sorted(unchecked, key=len):
         norm_root = os.path.normcase(root)
