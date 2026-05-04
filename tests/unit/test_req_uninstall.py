@@ -4,11 +4,12 @@ import os
 import sys
 from collections.abc import Iterator
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, PropertyMock
 
 import pytest
 
 import pip._internal.req.req_uninstall
+from pip._internal.metadata.base import BaseDistribution
 from pip._internal.req.req_uninstall import (
     StashedUninstallPathSet,
     UninstallPathSet,
@@ -63,6 +64,10 @@ def test_compressed_listing(tmpdir: Path) -> None:
             str(os.path.join(tmpdir, path.replace("/", os.path.sep))) for path in paths
         ]
 
+    mock_dist = Mock(spec=BaseDistribution)
+
+    type(mock_dist).installed_location = PropertyMock(return_value=str(tmpdir / "lib"))
+
     sample = in_tmpdir(
         [
             "lib/mypkg.dist-info/METADATA",
@@ -85,6 +90,21 @@ def test_compressed_listing(tmpdir: Path) -> None:
             "lib/mypkg2/__init__.py",
             "lib/mypkg2/my_awesome_code.py",
             "lib/mypkg2/__pycache__/my_awesome_code-magic.skip.pyc",
+            # test namespace package collapses completely
+            "lib/nspkg/__init__.skip.py",
+            "lib/nspkg/module1/__init__.skip.py",
+            "lib/nspkg/module1/__main__.skip.py",
+            "lib/nspkg/module2/__init__.py",
+            "lib/nspkg/module2/__main__.py",
+            # test that nspkg collapses when both modules are gone
+            "lib/nspkg2/__init__.py",
+            "lib/nspkg2/module1/__init__.py",
+            "lib/nspkg2/module1/__main__.py",
+            "lib/nspkg2/module2/__init__.py",
+            "lib/nspkg2/module2/__main__.py",
+            # test that PEP 420 nspkg collapses when both modules are gone
+            "lib/nspkg3/module1/__main__.py",
+            "lib/nspkg3/module2/__main__.py",
         ]
     )
 
@@ -113,6 +133,10 @@ def test_compressed_listing(tmpdir: Path) -> None:
             "lib/mypkg/*",
             "lib/random_other_place/file_without_a_dot_pyc",
             "lib/mypkg2/*",
+            "lib/nspkg/module2/*",
+            "lib/nspkg2/*",
+            "lib/nspkg3/module1/__main__.py",
+            "lib/nspkg3/module2/__main__.py",
         ]
     )
 
@@ -136,11 +160,14 @@ def test_compressed_listing(tmpdir: Path) -> None:
             "lib/mypkg/support/__pycache__/",
             "lib/random_other_place/",
             "lib/mypkg2/",
+            "lib/nspkg/module2/",
+            "lib/nspkg2/",
+            "lib/nspkg3/",
         ]
     )
 
     will_remove, will_skip = compress_for_output_listing(sample)
-    will_rename = compress_for_rename(sample)
+    will_rename = compress_for_rename(sample, mock_dist)
     assert sorted(expected_skip) == sorted(compact(will_skip))
     assert sorted(expected_remove) == sorted(compact(will_remove))
     assert sorted(expected_rename) == sorted(compact(will_rename))
@@ -313,9 +340,9 @@ class TestStashedUninstallPathSet:
                 for p in [
                     "A/B/",  # selected everything below A/B
                     "A/C/d.py",  # did not select everything below A/C
-                    "A/E/",  # only empty folders remain under A/E
+                    # only empty folders remain under A/E but we don't own A/E/F
+                    "A/E/f.py",
                     "A/G/g.py",  # non-empty folder remains under A/G
-                    "A/B/D/",  # selected due to directory in list
                 ]
             ]
         )
