@@ -108,7 +108,9 @@ def compact(paths: Iterable[str]) -> set[str]:
     return short_paths
 
 
-def compress_for_rename(paths: Iterable[str]) -> set[str]:
+def compress_for_rename(
+    paths: Iterable[str], dist: BaseDistribution | None = None
+) -> set[str]:
     """Returns a set containing the paths that need to be renamed.
 
     This set may include directories when the original sequence of paths
@@ -178,9 +180,16 @@ def compress_for_rename(paths: Iterable[str]) -> set[str]:
     # We want to identify the top most unique candidate directories so that we
     # only process a directory and its children once
     roots: list[str] = []
-    for candidate in sorted(potential_roots, key=len):
+    root_candidates = potential_roots.copy()
+    # keep the install prefix out of the potential roots since they are specifically
+    # derived from the entries, however, we want the install location so we can
+    # determine the actual installation root and parent namespace directories.
+    if dist and dist.installed_location:
+        install_path = os.path.join(dist.installed_location, "")
+        root_candidates.update({install_path: install_path})
+    for candidate in sorted(root_candidates, key=len):
         if not any(candidate.startswith(os.path.normcase(r)) for r in roots):
-            roots.append(potential_roots[candidate])
+            roots.append(root_candidates[candidate])
 
     # a list of all directories we may own
     owned_paths: set[str] = set()
@@ -205,7 +214,6 @@ def compress_for_rename(paths: Iterable[str]) -> set[str]:
     def process_directory(real_dir: str) -> bool:
         """
         Returns True if the directory is perfectly clean.
-        Reads the disk exactly once per valid directory.
 
         real_dir should generally not be in normcase for purposes of fidelity
         """
@@ -275,6 +283,15 @@ def compress_for_rename(paths: Iterable[str]) -> set[str]:
                     poisoned = True
 
         if poisoned:
+            return False
+
+        # Do not allow the install location to become a wildcard as we do not
+        # want to try to remove this directory
+        if (
+            dist
+            and dist.installed_location
+            and norm_join(dist.installed_location, "") == norm_dir
+        ):
             return False
 
         # If we claim ownership of all physical files/subdirectories via wildcards
