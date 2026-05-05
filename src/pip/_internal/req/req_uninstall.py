@@ -211,113 +211,94 @@ def compress_for_rename(
                         owned_paths.add(current)
                 break
 
-    def process_directory(real_dir: str) -> bool:
-        """
-        Returns True if the directory is perfectly clean.
+    final_wildcards: dict[str, str] = wildcards.copy()
 
-        real_dir should generally not be in normcase for purposes of fidelity
-        """
-        norm_dir = norm_join(real_dir, "")
+    for root_orig in roots:
+        # Map to track if a directory's children poisoned it
+        # key: norm_dir, value: bool (is_poisoned)
+        poison_registry: dict[str, bool] = {}
 
-        if norm_dir in wildcards:
-            return True
+        # Track files found to handle the O(1) removal logic
+        # key: norm_dir, value: set of files
+        found_files_map: dict[str, set[str]] = {}
 
-        try:
-            with os.scandir(real_dir) as it:
-                entries = list(it)
-        except OSError:
-            return False
+        stack = [(root_orig, 0)]
 
-        poisoned = False
-        local_files = set()
+        while stack:
+            curr_orig, state = stack.pop()
+            norm_dir = norm_join(curr_orig, "")
 
-        for entry in entries:
-            norm_entry = os.path.normcase(entry.path)
-
-            if entry.is_dir(follow_symlinks=False):
-                _dir = norm_entry + os.sep
-
-                # is the dir in our wildcards?
-                if _dir in wildcards:
+            if state == 0:
+                # --- STATE 0: ENTERING ---
+                if norm_dir in final_wildcards:
                     continue
 
-                # Is the path out of bounds? A possible scenario is a sibling
-                # directory for a namespace package not owned by the distribution
-                # being uninstalled. If so, we cannot wildcard the current
-                # directory and we do not need to process files in that path.
-                # We must continue processing this path for files we may still own
-                #
-                # Note: Even if the candidate dir is empty, we do _not_ remove it.
-                # To do so would require processing the directory and for it to be
-                # clean (not poisoned), we could then possibly clean up the dir.
-                #
-                # The packaging guidelines say:
-                #   Directories should not be listed.
-                # and
-                #   To completely uninstall a package, a tool needs to remove all
-                #   files listed in RECORD, all .pyc files (of all optimization
-                #   levels) corresponding to removed .py files, _and any directories
-                #   emptied by the uninstallation_.
-                # See:
-                #   https://packaging.python.org/en/latest/specifications/recording-installed-packages/#the-record-file
-                #
-                # Since this RECORD did not own that directory, and should != shall,
-                # meaning some package could have made that empty path, we're
-                # following the guidance to the letter.
-                # If we change our mind:
-                #   poisoned = not process_directory(entry.path)
-                if _dir not in owned_paths:
-                    poisoned = True
+                try:
+                    entries = list(os.scandir(curr_orig))
+                except OSError:
+                    poison_registry[norm_dir] = True
                     continue
 
-                # if the descendant is not wholly captured by the file list and
-                # thus a wildcard, then we cannot be a wildcard either.
-                if not process_directory(entry.path):
-                    poisoned = True
+                # Push self back with State 1 (to be processed AFTER children)
+                stack.append((curr_orig, 1))
+                found_files_map[norm_dir] = set()
+                poison_registry[norm_dir] = False  # Assume clean until proven otherwise
+
+                for entry in entries:
+                    e_norm = os.path.normcase(entry.path)
+                    if entry.is_dir(follow_symlinks=False):
+                        e_slashed = e_norm + os.sep
+                        if e_slashed in final_wildcards:
+                            continue
+                        if e_slashed not in owned_paths:
+                            poison_registry[norm_dir] = True
+                        else:
+                            # Push child to be visited
+                            stack.append((entry.path, 0))
+                    else:
+                        if e_norm in remaining:
+                            found_files_map[norm_dir].add(e_norm)
+                        else:
+                            poison_registry[norm_dir] = True
+
             else:
-                # We've identified a file in the current directory and have no directive
-                # to claim is as our own (wildcard or discrete entry in remaining)
-                if norm_entry in remaining:
-                    local_files.add(norm_entry)
-                else:
-                    poisoned = True
+                # --- STATE 1: LEAVING (The Collapse Decision) ---
+                is_root = os.path.normcase(curr_orig) == os.path.normcase(root_orig)
+                # Check if we were poisoned by a foreign file or an un-collapsible child
+                protected = (
+                    dist
+                    and dist.installed_location
+                    and norm_join(dist.installed_location, "") == norm_dir
+                )
+                if poison_registry[norm_dir] or protected:  # or is_root:
+                    # Bubble poison up to parent
+                    parent_dir = norm_join(
+                        os.path.dirname(curr_orig.rstrip(os.sep)), ""
+                    )
+                    if parent_dir in poison_registry:
+                        poison_registry[parent_dir] = True
+                    continue
 
-        if poisoned:
-            return False
+                # Success! Collapse this directory
+                final_wildcards[norm_dir] = os.path.join(curr_orig, "")
 
-        # Do not allow the install location to become a wildcard as we do not
-        # want to try to remove this directory
-        if (
-            dist
-            and dist.installed_location
-            and norm_join(dist.installed_location, "") == norm_dir
-        ):
-            return False
+                # remove files we actually found via disk
+                remaining.difference_update(found_files_map[norm_dir])
+                # and now delete any entries from remaining that we expected but
+                # didn't find because they may have been deleted otherwise
+                expected_here = {
+                    f
+                    for f in remaining
+                    if f.startswith(norm_dir) and os.sep not in f[len(norm_dir) :]
+                }
+                remaining.difference_update(expected_here)
 
-        # If we claim ownership of all physical files/subdirectories via wildcards
-        # or entries in the file list, then we are a wildcard and can remove all
-        # entries matching our prefix.
-        wildcards[norm_dir] = os.path.join(real_dir, "")
-        remaining.difference_update(local_files)
-        # This covers the case where a file is in the file list but not on disk and
-        # we never iterated on it. Remove so there are no rogue entries in `remaining`.
-        # We could improve this with a mapping of parent path to files
-        remaining.difference_update({f for f in remaining if f.startswith(norm_dir)})
-        return True
+    # for w in sorted(wildcards, key=len):
+    #     orig_w = wildcards[w]
+    #     if not any(w.startswith(os.path.normcase(fw)) for fw in final_wildcards):
+    #         final_wildcards.add(orig_w)
 
-    # Process the top level roots we identified
-    for root in roots:
-        process_directory(root)
-
-    # Because a child adds itself to wildcards before its parent does,
-    # we need to filter out the children if the parent ultimately succeeded.
-    final_wildcards: set[str] = set()
-    for w in sorted(wildcards, key=len):
-        orig_w = wildcards[w]
-        if not any(w.startswith(os.path.normcase(fw)) for fw in final_wildcards):
-            final_wildcards.add(orig_w)
-
-    return {case_map[p] for p in remaining} | final_wildcards
+    return {case_map[p] for p in remaining} | set(final_wildcards.values())
 
 
 def compress_for_output_listing(paths: Iterable[str]) -> tuple[set[str], set[str]]:

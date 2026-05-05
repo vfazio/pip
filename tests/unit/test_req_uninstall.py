@@ -339,6 +339,7 @@ class TestStashedUninstallPathSet:
                 os.path.sep.join(p.split("/"))
                 for p in [
                     "A/B/",  # selected everything below A/B
+                    "A/B/D/",
                     "A/C/d.py",  # did not select everything below A/C
                     # only empty folders remain under A/E but we don't own A/E/F
                     "A/E/f.py",
