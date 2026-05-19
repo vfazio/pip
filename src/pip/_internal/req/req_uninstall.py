@@ -107,6 +107,7 @@ def compact(paths: Iterable[str]) -> set[str]:
             short_paths.add(path)
     return short_paths
 
+
 class PathCompactor:
     """
     Like a trash compactor, but less destructive.
@@ -116,7 +117,7 @@ class PathCompactor:
 
     def __init__(self, paths: Iterable[str], preserved_roots: Iterable[str] | None):
         self._paths = paths
-        self._preserved_roots = preserved_roots  #TODO: parse to normcase
+        self._preserved_roots = preserved_roots  # TODO: parse to normcase
         self._case_map: dict[str, str] = {}
         self._remaining: set[str] = set()
         self._wildcards: dict[str, str] = {}
@@ -131,7 +132,7 @@ class PathCompactor:
         return self._paths
 
     @staticmethod
-    def norm_join(*a: str) -> str:
+    def _norm_join(*a: str) -> str:
         return os.path.normcase(os.path.join(*a))
 
     def _parse_paths(self) -> None:
@@ -141,10 +142,13 @@ class PathCompactor:
             norm_path = os.path.normcase(path)
             norm_dir = os.path.dirname(norm_path)
 
-            # We do _not_ add the files within wildcard paths.
-            # To speed up whether a file is within a wildcard, we break the
-            # path up into components and cache the answer so other files can
-            # take advantage of the lookup.
+            # We do _not_ add the files within wildcard paths to the remaining set.
+            #
+            # The wildcard pattern will always appear first due to the sorted strings.
+            #
+            # To speed up the determination of whether a file is within a wildcard,
+            # we break the path up into components and cache the answer so other
+            # files can take advantage of the lookup.
             is_covered = covered_cache.get(norm_dir)
             if is_covered is None:
                 # Only do the expensive walk if the cache misses
@@ -166,7 +170,9 @@ class PathCompactor:
 
             try:
                 if stat.S_ISDIR(os.stat(path, follow_symlinks=False).st_mode):
-                    w_key = norm_path if norm_path.endswith(os.sep) else norm_path + os.sep
+                    w_key = (
+                        norm_path if norm_path.endswith(os.sep) else norm_path + os.sep
+                    )
                     w_orig = path if path.endswith(os.sep) else path + os.sep
                     self._wildcards[w_key] = w_orig
                     # wildcards are also potential roots
@@ -181,24 +187,54 @@ class PathCompactor:
             p_dir_norm = norm_dir if norm_dir.endswith(os.sep) else norm_dir + os.sep
             if p_dir_norm not in self._potential_roots:
                 orig_dir = os.path.dirname(path)
-                p_dir_orig = orig_dir if orig_dir.endswith(os.sep) else orig_dir + os.sep
+                p_dir_orig = (
+                    orig_dir if orig_dir.endswith(os.sep) else orig_dir + os.sep
+                )
                 self._potential_roots[p_dir_norm] = p_dir_orig
 
-    def _calculate_roots(self) -> None:
-        # Outside of the initial pass, all data should be in a known format
+    # def _calculate_roots(self) -> None:
+    #     # Outside of the initial pass, all data should be in a known format
 
-        # We want to identify the top most unique candidate directories so that we
-        # only process a directory and its children once
+    #     # We want to identify the top most unique candidate directories so that we
+    #     # only process a directory and its children once
+    #     root_candidates = self._potential_roots.copy()
+    #     # keep the install prefix out of the potential roots since they are specifically
+    #     # derived from the entries, however, we want the install location so we can
+    #     # determine the actual installation root and parent namespace directories.
+    #     for reserved in self._preserved_roots:
+    #         install_path = os.path.join(reserved, "")
+    #         root_candidates.update({os.path.normcase(install_path): install_path})
+    #     for candidate in sorted(root_candidates, key=len):
+    #         if not any(candidate.startswith(os.path.normcase(r)) for r in self._roots):
+    #             self._roots.append(root_candidates[candidate])
+
+    def _calculate_roots(self) -> None:
         root_candidates = self._potential_roots.copy()
-        # keep the install prefix out of the potential roots since they are specifically
-        # derived from the entries, however, we want the install location so we can
-        # determine the actual installation root and parent namespace directories.
-        for reserved in self._preserved_roots:
-            install_path = os.path.join(reserved, "")
-            root_candidates.update({os.path.normcase(install_path): install_path})
-        for candidate in sorted(root_candidates, key=len):
-            if not any(candidate.startswith(os.path.normcase(r)) for r in self._roots):
-                self._roots.append(root_candidates[candidate])
+
+        # Safely normalize and format the preserved roots, injecting them into candidates
+        if self._preserved_roots:
+            for reserved in self._preserved_roots:
+                install_path = os.path.join(reserved, "")
+                root_candidates[os.path.normcase(install_path)] = install_path
+
+        # Sort ALPHABETICALLY by normalized path string keys
+        sorted_candidates = sorted(root_candidates.keys())
+
+        if not sorted_candidates:
+            return
+
+        # Linear sweep: because it's normalized and sorted, children *must* come after parents
+        current_root_norm = sorted_candidates[0]
+        self._roots.append(root_candidates[current_root_norm])
+
+        for candidate_norm in sorted_candidates[1:]:
+            # If the next path starts with our current active root, it's a child. Skip it.
+            if candidate_norm.startswith(current_root_norm):
+                continue
+
+            # We found a completely new branch namespace
+            current_root_norm = candidate_norm
+            self._roots.append(root_candidates[current_root_norm])
 
     def _calculate_owned_paths(self) -> None:
         # Now that we know the roots, we can sweep through the files list
@@ -227,26 +263,51 @@ class PathCompactor:
         # which is may not be described in the path list, so the list of owned
         # paths is the potential roots capped by the highest available root path
         #
+        # for rs_norm in self._potential_roots:
+        #     for r_orig in self._roots:
+        #         r_norm = os.path.normcase(r_orig)
+
+        #         if rs_norm.startswith(r_norm):
+        #             # Calculate the lineage segments
+        #             tail = rs_norm[len(r_norm) :]
+
+        #             current = r_norm
+        #             self._owned_paths.add(current)
+
+        #             if tail:
+        #                 parts = [p for p in tail.split(os.sep) if p]
+        #                 for part in parts:
+        #                     current = current + part + os.sep
+        #                     self._owned_paths.add(current)
+        #             break
+
+        norm_roots_set = {os.path.normcase(r) for r in self._roots}
+
+        # Walk backwards up the directory string tree for each potential root
         for rs_norm in self._potential_roots:
-            for r_orig in self._roots:
-                r_norm = os.path.normcase(r_orig)
+            curr = rs_norm
+            lineage = []
 
-                if rs_norm.startswith(r_norm):
-                    # Calculate the lineage segments
-                    tail = rs_norm[len(r_norm) :]
+            while curr:
+                lineage.append(curr)
 
-                    current = r_norm
-                    self._owned_paths.add(current)
-
-                    if tail:
-                        parts = [p for p in tail.split(os.sep) if p]
-                        for part in parts:
-                            current = current + part + os.sep
-                            self._owned_paths.add(current)
+                # If we hit an official root, we own this entire gathered line
+                if curr in norm_roots_set:
+                    self._owned_paths.update(lineage)
                     break
-    
+
+                # Pop off the last folder segment
+                parent = os.path.dirname(curr.rstrip(os.sep))
+                parent_slashed = parent if parent.endswith(os.sep) else parent + os.sep
+
+                # Safeguard: if we hit the filesystem root, stop
+                # This should never happen since roots are derived from potential roots
+                if parent_slashed == curr:
+                    break
+                curr = parent_slashed
+
     def _process_roots(self) -> None:
-        self._final_wildcards: dict[str, str] = self._wildcards.copy()
+        self._final_wildcards = self._wildcards.copy()
 
         for root_orig in self._roots:
             # Map to track if a directory's children poisoned it
@@ -278,7 +339,9 @@ class PathCompactor:
                     # Push self back with State 1 (to be processed AFTER children)
                     stack.append((curr_orig, 1))
                     found_files_map[norm_dir] = set()
-                    poison_registry[norm_dir] = False  # Assume clean until proven otherwise
+                    poison_registry[norm_dir] = (
+                        False  # Assume clean until proven otherwise
+                    )
 
                     for entry in entries:
                         e_norm = os.path.normcase(entry.path)
@@ -301,7 +364,11 @@ class PathCompactor:
                 else:
                     is_root = os.path.normcase(curr_orig) == os.path.normcase(root_orig)
                     # Check if we were poisoned by a foreign file or an un-collapsible child
-                    protected = (norm_dir in self._preserved_roots)
+                    protected = (
+                        False
+                        if not self._preserved_roots
+                        else norm_dir in self._preserved_roots
+                    )
                     if poison_registry[norm_dir] or protected:  # or is_root:
                         # Bubble poison up to parent
                         parent_dir = self._norm_join(
@@ -400,36 +467,88 @@ def compress_for_rename(
     # We want to identify the top most unique candidate directories so that we
     # only process a directory and its children once
     roots: list[str] = []
+    # root_candidates = potential_roots.copy()
+    # # keep the install prefix out of the potential roots since they are specifically
+    # # derived from the entries, however, we want the install location so we can
+    # # determine the actual installation root and parent namespace directories.
+    # if dist and dist.installed_location:
+    #     install_path = os.path.join(dist.installed_location, "")
+    #     root_candidates.update({install_path: install_path})
+    # for candidate in sorted(root_candidates, key=len):
+    #     if not any(candidate.startswith(os.path.normcase(r)) for r in roots):
+    #         roots.append(root_candidates[candidate])
+
     root_candidates = potential_roots.copy()
-    # keep the install prefix out of the potential roots since they are specifically
-    # derived from the entries, however, we want the install location so we can
-    # determine the actual installation root and parent namespace directories.
+
+    # Safely normalize and format the preserved roots, injecting them into candidates
+    # if self._preserved_roots:
+    #     for reserved in self._preserved_roots:
+    #         install_path = os.path.join(reserved, "")
+    #         root_candidates[os.path.normcase(install_path)] = install_path
+
     if dist and dist.installed_location:
         install_path = os.path.join(dist.installed_location, "")
         root_candidates.update({install_path: install_path})
-    for candidate in sorted(root_candidates, key=len):
-        if not any(candidate.startswith(os.path.normcase(r)) for r in roots):
-            roots.append(root_candidates[candidate])
+    # Sort ALPHABETICALLY by normalized path string keys
+    sorted_candidates = sorted(root_candidates.keys())
+
+    # Linear sweep: because it's normalized and sorted, children *must* come after parents
+    current_root_norm = sorted_candidates[0]
+    roots.append(root_candidates[current_root_norm])
+
+    for candidate_norm in sorted_candidates[1:]:
+        # If the next path starts with our current active root, it's a child. Skip it.
+        if candidate_norm.startswith(current_root_norm):
+            continue
+
+        # We found a completely new branch namespace
+        current_root_norm = candidate_norm
+        roots.append(root_candidates[current_root_norm])
 
     # a list of all directories we may own
     owned_paths: set[str] = set()
+    # for rs_norm in potential_roots:
+    #     for r_orig in roots:
+    #         r_norm = os.path.normcase(r_orig)
+
+    #         if rs_norm.startswith(r_norm):
+    #             # Calculate the lineage segments
+    #             tail = rs_norm[len(r_norm) :]
+
+    #             current = r_norm
+    #             owned_paths.add(current)
+
+    #             if tail:
+    #                 parts = [p for p in tail.split(os.sep) if p]
+    #                 for part in parts:
+    #                     current = current + part + os.sep
+    #                     owned_paths.add(current)
+    #             break
+
+    norm_roots_set = {os.path.normcase(r) for r in roots}
+
+    # Walk backwards up the directory string tree for each potential root
     for rs_norm in potential_roots:
-        for r_orig in roots:
-            r_norm = os.path.normcase(r_orig)
+        curr = rs_norm
+        lineage = []
 
-            if rs_norm.startswith(r_norm):
-                # Calculate the lineage segments
-                tail = rs_norm[len(r_norm) :]
+        while curr:
+            lineage.append(curr)
 
-                current = r_norm
-                owned_paths.add(current)
-
-                if tail:
-                    parts = [p for p in tail.split(os.sep) if p]
-                    for part in parts:
-                        current = current + part + os.sep
-                        owned_paths.add(current)
+            # If we hit an official root, we own this entire gathered line
+            if curr in norm_roots_set:
+                owned_paths.update(lineage)
                 break
+
+            # Pop off the last folder segment
+            parent = os.path.dirname(curr.rstrip(os.sep))
+            parent_slashed = parent if parent.endswith(os.sep) else parent + os.sep
+
+            # Safeguard: if we hit the filesystem root, stop
+            # This should never happen since roots are derived from potential roots
+            if parent_slashed == curr:
+                break
+            curr = parent_slashed
 
     final_wildcards: dict[str, str] = wildcards.copy()
 
