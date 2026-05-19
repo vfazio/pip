@@ -111,7 +111,7 @@ class PathCompactor:
     """
     Like a trash compactor, but less destructive.
 
-    Remember, garbage in, garbage out.
+    Remember: garbage in, garbage out.
     """
 
     def __init__(self, paths: Iterable[str], preserved_roots: Iterable[str] | None):
@@ -124,6 +124,7 @@ class PathCompactor:
         self._roots: list[str] = []
         self._owned_paths: set[str] = set()
         self._final_wildcards: dict[str, str] = {}
+        self._skipped_files: set[str] = set()
 
     @property
     def paths(self) -> Iterable[str]:
@@ -168,6 +169,8 @@ class PathCompactor:
                     w_key = norm_path if norm_path.endswith(os.sep) else norm_path + os.sep
                     w_orig = path if path.endswith(os.sep) else path + os.sep
                     self._wildcards[w_key] = w_orig
+                    # wildcards are also potential roots
+                    self._potential_roots[w_key] = w_orig
                     covered_cache[norm_path] = True
                     continue
             except OSError:
@@ -200,6 +203,30 @@ class PathCompactor:
     def _calculate_owned_paths(self) -> None:
         # Now that we know the roots, we can sweep through the files list
         # to determine what paths we own
+        #
+        # This seems unnecessary since all potential roots are owned paths, however
+        # the important part is determining what level of parent paths are owned
+        # since roots can be influenced by information from the distribution.
+        #
+        # For <purelib>/pkg/ns/module1/file.py and <purelib>/pkg/ns/module2/file.py, a
+        # naive "owned path" search may only determine <purelib>/pkg/ns/module1/ and
+        # <purelib>/pkg/ns/module2/ as owned paths. In this case, when removing
+        # files, the safest assumption is that we can collapse and remove the
+        # module1 and module2 directories, but not necessarily pkg/ns/ or pkg/
+        # because we do not know how far up we can traverse to perform directory removal
+        # and may traverse up to <purelib>/ (or higher) and attempt to remove that
+        # path if this was the final package being removed.
+        #
+        # However, when informed that the installation root is <purelib>/ we know
+        # we will never traverse above this path and it can be inferred that all
+        # components subsequent to <purelib>/ are owned paths and are thus subject
+        # to being collapsed if all files below them have been removed
+        #
+        # We cannot assume that everything subsequent to a root is an
+        # owned path since then we would potentially remove <purelib>/pkg/ns/module3/
+        # which is may not be described in the path list, so the list of owned
+        # paths is the potential roots capped by the highest available root path
+        #
         for rs_norm in self._potential_roots:
             for r_orig in self._roots:
                 r_norm = os.path.normcase(r_orig)
@@ -237,8 +264,9 @@ class PathCompactor:
                 norm_dir = self._norm_join(curr_orig, "")
 
                 if state == 0:
-                    # --- STATE 0: ENTERING ---
-                    if norm_dir in self._final_wildcards:
+                    # If it's a wildcard, there's nothing to do because there
+                    # are no files in the remaining set to process
+                    if norm_dir in self._wildcards:
                         continue
 
                     try:
@@ -256,18 +284,19 @@ class PathCompactor:
                         e_norm = os.path.normcase(entry.path)
                         if entry.is_dir(follow_symlinks=False):
                             e_slashed = e_norm + os.sep
-                            if e_slashed in self._final_wildcards:
-                                continue
-                            if e_slashed not in self._owned_paths:
-                                poison_registry[norm_dir] = True
-                            else:
+                            # if e_slashed in self._wildcards:
+                            #     continue
+                            if e_slashed in self._owned_paths:
                                 # Push child to be visited
                                 stack.append((entry.path, 0))
+                            else:
+                                poison_registry[norm_dir] = True
                         else:
                             if e_norm in self._remaining:
                                 found_files_map[norm_dir].add(e_norm)
                             else:
                                 poison_registry[norm_dir] = True
+                                self._skipped_files.add(entry.path)
 
                 else:
                     is_root = os.path.normcase(curr_orig) == os.path.normcase(root_orig)
@@ -289,6 +318,7 @@ class PathCompactor:
                     self._remaining.difference_update(found_files_map[norm_dir])
                     # and now delete any entries from remaining that we expected but
                     # didn't find because they may have been deleted otherwise
+                    # Note this searches for immediate files hence the os.sep search
                     expected_here = {
                         f
                         for f in self._remaining
@@ -351,6 +381,7 @@ def compress_for_rename(
                 w_key = norm_path if norm_path.endswith(os.sep) else norm_path + os.sep
                 w_orig = path if path.endswith(os.sep) else path + os.sep
                 wildcards[w_key] = w_orig
+                potential_roots[w_key] = w_orig
                 covered_cache[norm_path] = True
                 continue
         except OSError:
@@ -419,7 +450,7 @@ def compress_for_rename(
 
             if state == 0:
                 # --- STATE 0: ENTERING ---
-                if norm_dir in final_wildcards:
+                if norm_dir in wildcards:
                     continue
 
                 try:
@@ -437,13 +468,13 @@ def compress_for_rename(
                     e_norm = os.path.normcase(entry.path)
                     if entry.is_dir(follow_symlinks=False):
                         e_slashed = e_norm + os.sep
-                        if e_slashed in final_wildcards:
-                            continue
-                        if e_slashed not in owned_paths:
-                            poison_registry[norm_dir] = True
-                        else:
+                        # if e_slashed in final_wildcards:
+                        #     continue
+                        if e_slashed in owned_paths:
                             # Push child to be visited
                             stack.append((entry.path, 0))
+                        else:
+                            poison_registry[norm_dir] = True
                     else:
                         if e_norm in remaining:
                             found_files_map[norm_dir].add(e_norm)
