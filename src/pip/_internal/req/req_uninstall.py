@@ -110,7 +110,7 @@ def compact(paths: Iterable[str]) -> set[str]:
 
 class PathCompactor:
     """
-    Like a trash compactor, but less destructive.
+    Like a trash compactor, but less destructive (hopefully).
 
     Remember: garbage in, garbage out.
     """
@@ -237,31 +237,43 @@ class PathCompactor:
             self._roots.append(root_candidates[current_root_norm])
 
     def _calculate_owned_paths(self) -> None:
-        # Now that we know the roots, we can sweep through the files list
-        # to determine what paths we own
+        # Now that we know the roots, we can sweep through the files list to
+        # determine what paths we may own.
         #
-        # This seems unnecessary since all potential roots are owned paths, however
-        # the important part is determining what level of parent paths are owned
+        # This may seems unnecessary since all potential roots are owned paths,
+        # but it is important to determine what level of parent paths are owned
         # since roots can be influenced by information from the distribution.
         #
-        # For <purelib>/pkg/ns/module1/file.py and <purelib>/pkg/ns/module2/file.py, a
-        # naive "owned path" search may only determine <purelib>/pkg/ns/module1/ and
-        # <purelib>/pkg/ns/module2/ as owned paths. In this case, when removing
-        # files, the safest assumption is that we can collapse and remove the
-        # module1 and module2 directories, but not necessarily pkg/ns/ or pkg/
-        # because we do not know how far up we can traverse to perform directory removal
-        # and may traverse up to <purelib>/ (or higher) and attempt to remove that
-        # path if this was the final package being removed.
+        # For:
+        #   <purelib>/pkg/ns/module1/file.py
+        #   <purelib>/pkg/ns/module2/file.py
+        #
+        # The roots will be
+        #   <purelib>/pkg/ns/module1/
+        #   <purelib>/pkg/ns/module2/
+        #
+        # The safest assumption using a naive search is that we can collapse and
+        # remove the module1 and module2 directories, but not necessarily pkg/ns/
+        # or pkg/ because we do not know how far up the directory hierarchy we can
+        # safely traverse to perform removal and may traverse up to or past <purelib>/
+        # and attempt to remove that path if it was the final package being removed.
         #
         # However, when informed that the installation root is <purelib>/ we know
         # we will never traverse above this path and it can be inferred that all
         # components subsequent to <purelib>/ are owned paths and are thus subject
-        # to being collapsed if all files below them have been removed
+        # to being collapsed if all files below them have been removed.
         #
-        # We cannot assume that everything subsequent to a root is an
-        # owned path since then we would potentially remove <purelib>/pkg/ns/module3/
-        # which is may not be described in the path list, so the list of owned
-        # paths is the potential roots capped by the highest available root path
+        # We obviously cannot assume that everything subsequent to a root is an
+        # owned path lest we potentially remove <purelib>/pkg/ns/module3/ which
+        # may not be described in the path list and whose presence should prevent
+        # the path from being collapsed as a wildcard for removal.
+        #
+        # If I were better at discrete math, I could write this as a formula but
+        # in English it's the set of paths that share a root ancestor which lie
+        # on any lineage path terminating at a potential root.
+        #
+        # These paths calculated here become candidates for wildcards if all
+        # files beneath them are removed.
         #
         # for rs_norm in self._potential_roots:
         #     for r_orig in self._roots:
