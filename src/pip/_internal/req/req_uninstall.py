@@ -117,7 +117,11 @@ class PathCompactor:
 
     def __init__(self, paths: Iterable[str], preserved_roots: Iterable[str] | None):
         self._paths = paths
-        self._preserved_roots = preserved_roots  # TODO: parse to normcase
+        self._preserved_roots: dict[str, str] = {}
+        if preserved_roots:
+            for root in preserved_roots:
+                root = os.path.join(root, "")
+                self._preserved_roots[os.path.normcase(root)] = root
         self._case_map: dict[str, str] = {}
         self._remaining: set[str] = set()
         self._wildcards: dict[str, str] = {}
@@ -211,24 +215,23 @@ class PathCompactor:
     def _calculate_roots(self) -> None:
         root_candidates = self._potential_roots.copy()
 
-        # Safely normalize and format the preserved roots, injecting them into candidates
+        # Add the preserved roots into the candidates
         if self._preserved_roots:
-            for reserved in self._preserved_roots:
-                install_path = os.path.join(reserved, "")
-                root_candidates[os.path.normcase(install_path)] = install_path
+            root_candidates.update(self._preserved_roots)
 
-        # Sort ALPHABETICALLY by normalized path string keys
+        # Sort alphabetically by normalized path string keys
         sorted_candidates = sorted(root_candidates.keys())
 
         if not sorted_candidates:
             return
 
-        # Linear sweep: because it's normalized and sorted, children *must* come after parents
+        # Because it's normalized and sorted, children *must* come after parents
         current_root_norm = sorted_candidates[0]
         self._roots.append(root_candidates[current_root_norm])
 
         for candidate_norm in sorted_candidates[1:]:
-            # If the next path starts with our current active root, it's a child. Skip it.
+            # If the next path starts with our current active root, it's a child
+            # and thus not a real root candidate: skip it.
             if candidate_norm.startswith(current_root_norm):
                 continue
 
@@ -375,7 +378,7 @@ class PathCompactor:
 
                 else:
                     is_root = os.path.normcase(curr_orig) == os.path.normcase(root_orig)
-                    # Check if we were poisoned by a foreign file or an un-collapsible child
+                    # Were we poisoned by a foreign file or an un-collapsible child?
                     protected = (
                         False
                         if not self._preserved_roots
@@ -504,7 +507,7 @@ def compress_for_rename(
     # Sort ALPHABETICALLY by normalized path string keys
     sorted_candidates = sorted(root_candidates.keys())
 
-    # Linear sweep: because it's normalized and sorted, children *must* come after parents
+    # Because it's normalized and sorted, children *must* come after parents
     current_root_norm = sorted_candidates[0]
     roots.append(root_candidates[current_root_norm])
 
