@@ -226,6 +226,7 @@ class PathCompactor:
             return
 
         # Because it's normalized and sorted, children *must* come after parents
+        # so the first entry is always a candidate
         current_root_norm = sorted_candidates[0]
         self._roots.append(root_candidates[current_root_norm])
 
@@ -296,30 +297,30 @@ class PathCompactor:
         #                     self._owned_paths.add(current)
         #             break
 
-        norm_roots_set = {os.path.normcase(r) for r in self._roots}
+        roots_ns = {os.path.normcase(r) for r in self._roots}
 
         # Walk backwards up the directory string tree for each potential root
-        for rs_norm in self._potential_roots:
-            curr = rs_norm
+        for root_ns in self._potential_roots:
+            curr_ns = root_ns
             lineage = []
 
-            while curr:
-                lineage.append(curr)
+            while curr_ns:
+                lineage.append(curr_ns)
 
                 # If we hit an official root, we own this entire gathered line
-                if curr in norm_roots_set:
+                if curr_ns in roots_ns:
                     self._owned_paths.update(lineage)
                     break
 
                 # Pop off the last folder segment
-                parent = os.path.dirname(curr.rstrip(os.sep))
-                parent_slashed = parent if parent.endswith(os.sep) else parent + os.sep
+                parent_n = os.path.dirname(curr_ns.rstrip(os.sep))
+                parent_ns = parent_n if parent_n.endswith(os.sep) else parent_n + os.sep
 
                 # Safeguard: if we hit the filesystem root, stop
                 # This should never happen since roots are derived from potential roots
-                if parent_slashed == curr:
+                if parent_ns == curr_ns:
                     break
-                curr = parent_slashed
+                curr_ns = parent_ns
 
     def _process_roots(self) -> None:
         self._final_wildcards = self._wildcards.copy()
