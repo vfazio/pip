@@ -5,6 +5,7 @@ import os
 import stat
 import sys
 import sysconfig
+from collections import defaultdict
 from collections.abc import Callable, Generator, Iterable
 from importlib.util import cache_from_source
 from typing import Any
@@ -124,6 +125,7 @@ class PathCompactor:
                 self._preserved_roots[os.path.normcase(root)] = root
         self._case_map: dict[str, str] = {}
         self._remaining: set[str] = set()
+        self._manifest_by_dir: dict[str, set[str]] = defaultdict(set)
         self._wildcards: dict[str, str] = {}
         self._potential_roots: dict[str, str] = {}
         self._roots: list[str] = []
@@ -189,6 +191,7 @@ class PathCompactor:
             self._case_map[norm_path] = path
             self._remaining.add(norm_path)
             p_dir_norm = norm_dir if norm_dir.endswith(os.sep) else norm_dir + os.sep
+            self._manifest_by_dir[p_dir_norm].add(norm_path)
             if p_dir_norm not in self._potential_roots:
                 orig_dir = os.path.dirname(path)
                 p_dir_orig = (
@@ -401,12 +404,8 @@ class PathCompactor:
                     self._remaining.difference_update(found_files_map[norm_dir])
                     # and now delete any entries from remaining that we expected but
                     # didn't find because they may have been deleted otherwise
-                    # Note this searches for immediate files hence the os.sep search
-                    expected_here = {
-                        f
-                        for f in self._remaining
-                        if f.startswith(norm_dir) and os.sep not in f[len(norm_dir) :]
-                    }
+                    # Note: this depends on defaultdict semantics.
+                    expected_here = self._manifest_by_dir[norm_dir]
                     self._remaining.difference_update(expected_here)
 
 
