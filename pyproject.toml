@@ -385,3 +385,7 @@ git-only = [
   ".mailmap",
   ".readthedocs-custom-redirects.yml"
 ]
+
+[tool.black]
+line-length = 88
+target-version = ['py310']
