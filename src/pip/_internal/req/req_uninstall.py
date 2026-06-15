@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import functools
 import os
-import stat
 import sys
 import sysconfig
 from collections import defaultdict
@@ -117,83 +116,76 @@ class PathCompactor:
     """
 
     def __init__(self, paths: Iterable[str], preserved_roots: Iterable[str] | None):
-        self._paths = paths
-        self._preserved_roots: dict[str, str] = {}
+        self._paths_o = set(paths)
+        self._preserved_roots_ns2os: dict[str, str] = {}
         if preserved_roots:
             for root in preserved_roots:
                 root = os.path.join(root, "")
-                self._preserved_roots[os.path.normcase(root)] = root
-        self._case_map: dict[str, str] = {}
-        self._remaining: set[str] = set()
-        self._manifest_by_dir: dict[str, set[str]] = defaultdict(set)
-        self._potential_roots: dict[str, str] = {}
-        self._roots: list[str] = []
-        self._owned_paths: set[str] = set()
-        self._final_wildcards: dict[str, str] = {}
-        self._skipped_files: set[str] = set()
+                self._preserved_roots_ns2os[os.path.normcase(root)] = root
+        self._case_map_n2o: dict[str, str] = {}
+        self._remaining_n: set[str] = set()
+        self._manifest_by_dir_ns2n: dict[str, set[str]] = defaultdict(set)
+        self._potential_roots_ns2os: dict[str, str] = {}
+        self._roots_os: list[str] = []
+        self._owned_paths_ns: set[str] = set()
+        self._final_wildcards_ns2os: dict[str, str] = {}
+        self._skipped_files_o: set[str] = set()
 
     @property
     def paths(self) -> Iterable[str]:
-        return self._paths
+        return self._paths_o
 
     def _parse_paths(self) -> None:
-        for path in self._paths:
-            norm_path = os.path.normcase(path)
-            norm_dir = os.path.dirname(norm_path)
+        sep = os.sep
+        # All paths are treated like files. By keeping it this way we avoid the
+        # need to stat each path to determine if it's a file/symlink/directory
+        # and make special case decisions. Those are deferred until the roots
+        # are iterated and the directory entries are compared to the paths in
+        # the list generated here.
+        #
+        # This works because if a file/symlink comes in, the parent directory is
+        # a potential root. When that directory gets iterated, we identify the
+        # file and clear it for removal. Unrecognized files in that parent
+        # directory prevent the folder from collapsing and becoming a wildcard.
+        #
+        # If a directory comes in, since we treat it like a file, its parent
+        # directory is added to potential roots and is then iterated over. When
+        # os.scandir returns the entry, it's identified as a directory type and
+        # we see it in the list of files schedule for removal, we treat it like
+        # a wildcard. Additional entries in that parent directory that are not
+        # scheduled for removal poison the parent for collapsing, but the path
+        # ID'd as a wildcard and all child directories do collapse.
+        #
+        # The most common use case will be __pycache__ directories which will be
+        # siblings to .py files in a package directory. Since the .py files will
+        # be in the RECORD anyway, there's a good chance these will collapse.
+        # The exception will be packages that install files in <purelib>, like
+        # six and typing_extensions, which will cause __pycache__ to be generated
+        # at that level. The parent directory will be <purelib> but the other
+        # entries in the directory will poison it and prevent it being wildcarded.
+        #
+        # In order to ensure the parent of the directory passed in is added to
+        # the potential roots to be iterated on, the path entry here must not
+        # a trailing slash so os.path.dirname gets the parent.
+        for path_o in self._paths_o:
+            # strip trailing separators in case a directory comes in with one
+            path_o = path_o.rstrip(sep)
 
-            self._case_map[norm_path] = path
-            self._remaining.add(norm_path)
-            p_dir_norm = norm_dir if norm_dir.endswith(os.sep) else norm_dir + os.sep
-            self._manifest_by_dir[p_dir_norm].add(norm_path)
-            if p_dir_norm not in self._potential_roots:
-                orig_dir = os.path.dirname(path)
-                p_dir_orig = (
-                    orig_dir if orig_dir.endswith(os.sep) else orig_dir + os.sep
-                )
-                self._potential_roots[p_dir_norm] = p_dir_orig
+            path_n = os.path.normcase(path_o)
+            p_dir_n = os.path.dirname(path_n)
 
-            # Register the path itself as a potential root. This allows us to avoid
-            # stat'ing every file in the path list or filtering by extension and
-            # leveraging `scandir` to reveal if this was actually a directory,
-            # this ensures it exists in `_owned_paths` so we are allowed to traverse it.
-            p_self_norm = (
-                norm_path if norm_path.endswith(os.sep) else norm_path + os.sep
-            )
-            if p_self_norm not in self._potential_roots:
-                p_self_orig = path if path.endswith(os.sep) else path + os.sep
-                self._potential_roots[p_self_norm] = p_self_orig
+            self._case_map_n2o[path_n] = path_o
+            self._remaining_n.add(path_n)
+            p_dir_ns = p_dir_n if p_dir_n.endswith(sep) else p_dir_n + sep
+            self._manifest_by_dir_ns2n[p_dir_ns].add(path_n)
+            if p_dir_ns not in self._potential_roots_ns2os:
+                p_dir_o = os.path.dirname(path_o)
+                p_dir_os = p_dir_o if p_dir_o.endswith(sep) else p_dir_o + sep
+                self._potential_roots_ns2os[p_dir_ns] = p_dir_os
 
-    def _calculate_roots(self) -> None:
-        root_candidates = self._potential_roots.copy()
-
-        # Add the preserved roots into the candidates
-        if self._preserved_roots:
-            root_candidates.update(self._preserved_roots)
-
-        # Sort alphabetically by normalized path string keys
-        sorted_candidates = sorted(root_candidates.keys())
-
-        if not sorted_candidates:
-            return
-
-        # Because it's normalized and sorted, children *must* come after parents
-        # so the first entry is always a candidate
-        current_root_norm = sorted_candidates[0]
-        self._roots.append(root_candidates[current_root_norm])
-
-        for candidate_norm in sorted_candidates[1:]:
-            # If the next path starts with our current active root, it's a child
-            # and thus not a real root candidate: skip it.
-            if candidate_norm.startswith(current_root_norm):
-                continue
-
-            # We found a completely new branch namespace
-            current_root_norm = candidate_norm
-            self._roots.append(root_candidates[current_root_norm])
-
-    def _calculate_owned_paths(self) -> None:
-        # Now that we know the roots, we can sweep through the files list to
-        # determine what paths we may own.
+    def _calculate_roots_and_owned_paths(self) -> None:
+        # We need to sweep through the files list to determine the roots to iterate
+        # and to determine what paths we may own.
         #
         # This may seems unnecessary since all potential roots are owned paths,
         # but it is important to determine what level of parent paths are owned
@@ -227,401 +219,198 @@ class PathCompactor:
         # in English it's the set of paths that share a root ancestor which lie
         # on any lineage path terminating at a potential root.
         #
-        # These paths calculated here become candidates for wildcards if all
-        # files beneath them are removed.
-        roots_ns = {os.path.normcase(r) for r in self._roots}
+        # The paths calculated here become candidates for wildcards if all files
+        # beneath them are removed.
+        sep = os.sep
+        root_candidates_ns2os = self._potential_roots_ns2os.copy()
 
-        # Pre-seed our memoization cache with known roots
-        verified_owned: set[str] = set(roots_ns)
-        verified_unowned: set[str] = set()
+        # Add the preserved roots into the candidates
+        if self._preserved_roots_ns2os:
+            root_candidates_ns2os.update(self._preserved_roots_ns2os)
 
-        # Walk backwards up the directory string tree for each potential root
-        for root_ns in self._potential_roots:
-            curr_ns = root_ns
-            lineage: list[str] = []
+        # Sort alphabetically by normalized path string keys
+        sorted_candidates_ns = sorted(root_candidates_ns2os.keys())
 
-            while curr_ns:
-                # We already proved this branch connects to a root
-                if curr_ns in verified_owned:
-                    verified_owned.update(lineage)
-                    break
+        if not sorted_candidates_ns:
+            return
 
-                # We already proved this branch hits the system root (unowned)
-                if curr_ns in verified_unowned:
-                    verified_unowned.update(lineage)
-                    break
+        # Because it's normalized and sorted, children *must* come after parents
+        # so the first entry is always a root.
+        current_root_ns = sorted_candidates_ns[0]
+        self._roots_os.append(root_candidates_ns2os[current_root_ns])
+        self._owned_paths_ns.add(current_root_ns)
 
-                lineage.append(curr_ns)
-
-                # Pop off the last folder segment
-                parent_n = os.path.dirname(curr_ns.rstrip(os.sep))
-                parent_ns = parent_n if parent_n.endswith(os.sep) else parent_n + os.sep
-
-                # Safeguard: if we hit the filesystem root, stop (_very_ unlikely)
-                if parent_ns == curr_ns:
-                    verified_unowned.update(lineage)
-                    break
-
-                curr_ns = parent_ns
-
-        # Assign the verified owned lineages (excluding the unowned ones)
-        self._owned_paths = verified_owned
+        for candidate_ns in sorted_candidates_ns[1:]:
+            # If the next path starts with our current active root, it's a child
+            # directory whose lineage we need to add to the set of owned paths
+            if candidate_ns.startswith(current_root_ns):
+                # Climb upwards to register all intermediate directories as owned.
+                # We stop as soon as we hit a lineage we've already registered
+                # (which will eventually be the current_root_ns).
+                curr_ns = candidate_ns
+                while curr_ns not in self._owned_paths_ns:
+                    self._owned_paths_ns.add(curr_ns)
+                    curr_ns = os.path.dirname(curr_ns.rstrip(os.sep)) + sep
+            else:  # We found a new root to traverse
+                current_root_ns = candidate_ns
+                self._roots_os.append(root_candidates_ns2os[current_root_ns])
+                self._owned_paths_ns.add(current_root_ns)
 
     def _process_roots(self) -> None:
-        self._final_wildcards = {}
+        sep = os.sep
+        for root_os in self._roots_os:
+            poisoned_dirs_ns: set[str] = set()
 
-        for root_orig in self._roots:
-            # Map to track if a directory's children poisoned it
-            # key: norm_dir, value: bool (is_poisoned)
-            poisoned_dirs: set[str] = set()
-
-            stack = [(root_orig, 0)]
+            stack = [(root_os, 0)]
 
             while stack:
                 curr_orig, state = stack.pop()
-                curr_norm = os.path.normcase(curr_orig)
-                norm_dir = (
-                    curr_norm if curr_norm.endswith(os.sep) else curr_norm + os.sep
-                )
+                curr_n = os.path.normcase(curr_orig)
+                curr_ns = curr_n if curr_n.endswith(sep) else curr_n + sep
 
                 if state == 0:
-                    # # If it's a wildcard, there's nothing to do because there
-                    # # are no files in the remaining set to process
-                    # if norm_dir in self._wildcards:
-                    #     continue
-
                     try:
                         entries = list(os.scandir(curr_orig))
                     except OSError:
-                        poisoned_dirs.add(norm_dir)
+                        poisoned_dirs_ns.add(curr_ns)
                         continue
 
                     # Push self back with State 1 (to be processed AFTER children)
                     stack.append((curr_orig, 1))
 
                     for entry in entries:
-                        e_norm = os.path.normcase(entry.path)
+                        entry_n = os.path.normcase(entry.path)
                         if entry.is_dir(follow_symlinks=False):
-                            e_slashed = e_norm + os.sep
+                            entry_ns = entry_n + sep
 
                             # If this directory was explicitly listed in the RECORD, it
-                            # will be sitting in `_remaining` so we own it.
-                            if e_norm in self._remaining:
+                            # should be treated as a wildcard. Wildcards do not allow
+                            # "foreign" files or directories to prevent removal
+                            if entry_n in self._remaining_n:
                                 # Register it as a wildcard immediately
-                                self._final_wildcards[e_slashed] = entry.path + os.sep
+                                self._final_wildcards_ns2os[entry_ns] = entry.path + sep
 
                                 # Search the list of directories for paths that
                                 # are under our wildcard and need to be removed
-                                dirs_to_wipe = [
-                                    d
-                                    for d in self._manifest_by_dir
-                                    if d.startswith(e_slashed) or d == e_slashed
+                                dirs_to_wipe_ns = [
+                                    d_ns
+                                    for d_ns in self._manifest_by_dir_ns2n
+                                    if d_ns.startswith(entry_ns) or d_ns == entry_ns
                                 ]
 
                                 # Wipe all associated files from remaining
-                                for d in dirs_to_wipe:
-                                    self._remaining.difference_update(
-                                        self._manifest_by_dir[d]
+                                for d_ns in dirs_to_wipe_ns:
+                                    self._remaining_n.difference_update(
+                                        self._manifest_by_dir_ns2n[d_ns]
                                     )
                                     # Delete the dict key so subsequent sweeps have
                                     # fewer directories to check
-                                    self._manifest_by_dir.pop(d, None)
+                                    del self._manifest_by_dir_ns2n[d_ns]
 
                                 # We also need to remove the explicit folder entry
                                 # itself (which was acting as a file in _remaining)
-                                self._remaining.discard(e_norm)
+                                self._remaining_n.discard(entry_n)
 
                                 # Skip traversal, we own it all.
                                 continue
 
-                            # if e_slashed in self._wildcards:
-                            #     continue
-                            if e_slashed in self._owned_paths:
+                            if entry_ns in self._owned_paths_ns:
                                 # Push child to be visited
                                 stack.append((entry.path, 0))
                             else:
-                                poisoned_dirs.add(norm_dir)
+                                poisoned_dirs_ns.add(curr_ns)
                         else:
-                            if e_norm not in self._remaining:
-                                poisoned_dirs.add(norm_dir)
-                                self._skipped_files.add(entry.path)
-
+                            if entry_n not in self._remaining_n:
+                                poisoned_dirs_ns.add(curr_ns)
+                                self._skipped_files_o.add(entry.path)
                 else:
-                    # is_root = os.path.normcase(curr_orig) == \
-                    # os.path.normcase(root_orig)
-                    # Were we poisoned by a foreign file or an un-collapsible child?
                     protected = (
                         False
-                        if not self._preserved_roots
-                        else norm_dir in self._preserved_roots
+                        if not self._preserved_roots_ns2os
+                        else curr_ns in self._preserved_roots_ns2os
                     )
-                    if norm_dir in poisoned_dirs or protected:  # or is_root:
+                    # Are we poisoned by a foreign file or an un-collapsible child
+                    # or are we within a path protected from wildcards
+                    if curr_ns in poisoned_dirs_ns or protected:
                         # Bubble poison up to parent
-                        parent_norm = os.path.normcase(
-                            os.path.dirname(curr_orig.rstrip(os.sep))
-                        )
-                        parent_dir = (
-                            parent_norm
-                            if parent_norm.endswith(os.sep)
-                            else parent_norm + os.sep
-                        )
-                        poisoned_dirs.add(parent_dir)
+                        poisoned_dirs_ns.add(os.path.dirname(curr_n) + sep)
                         continue
 
+                    # Because we evaluate bottom-up, child wildcards are already
+                    # in the dictionary. If this parent is now collapsing, those
+                    # children are redundant and should be swallowed.
+                    redundant_wildcards_ns = [
+                        w_ns
+                        for w_ns in self._final_wildcards_ns2os
+                        if w_ns.startswith(curr_ns)
+                    ]
+                    for w_ns in redundant_wildcards_ns:
+                        del self._final_wildcards_ns2os[w_ns]
+
                     # Success! Collapse this directory
-                    self._final_wildcards[norm_dir] = os.path.join(curr_orig, "")
+                    self._final_wildcards_ns2os[curr_ns] = os.path.join(curr_orig, "")
 
                     # and now delete any entries from remaining that we expected but
                     # didn't find because they may have been deleted otherwise
                     # Note: this depends on defaultdict semantics.
-                    expected_here = self._manifest_by_dir[norm_dir]
-                    self._remaining.difference_update(expected_here)
+                    expected_here_n = self._manifest_by_dir_ns2n[curr_ns]
+                    self._remaining_n.difference_update(expected_here_n)
+                    del self._manifest_by_dir_ns2n[curr_ns]
+                    self._remaining_n.discard(curr_n)
+
+    def compress_for_rename(self) -> set[str]:
+        return {self._case_map_n2o[p] for p in self._remaining_n} | set(
+            self._final_wildcards_ns2os.values()
+        )
+
+    def compress_for_output_listing(self) -> tuple[set[str], set[str]]:
+        # The original list of paths may contain non-slashed directory entries.
+        # Any directories should be classified as wildcards, so remove them from
+        # the result so that the wildcards are displayed with /*.
+        # This is mostly a theoretical issue since the primary wildcard will be
+        # __pycache__ which should collapse under it's parent, but do this anyway.
+        will_remove = {self._case_map_n2o[p] for p in self._remaining_n}
+
+        # Append the successful wildcards with the * indicator
+        will_remove.update(
+            {path_os + "*" for path_os in self._final_wildcards_ns2os.values()}
+        )
+
+        return will_remove, self._skipped_files_o
 
 
-def compress_for_rename(
-    paths: Iterable[str], dist: BaseDistribution | None = None
-) -> set[str]:
+def compress_for_rename(paths: Iterable[str]) -> set[str]:
     """Returns a set containing the paths that need to be renamed.
 
     This set may include directories when the original sequence of paths
     included every file on disk.
-
-    Note that since we do not control the input into this function, we do things
-    like checking for os.sep in case external logic ever changes.
     """
-    case_map: dict[str, str] = {}
-    remaining: set[str] = set()
-    wildcards: dict[str, str] = {}
+    case_map = {os.path.normcase(p): p for p in paths}
+    remaining = set(case_map)
+    unchecked = sorted({os.path.split(p)[0] for p in case_map.values()}, key=len)
+    wildcards: set[str] = set()
 
     def norm_join(*a: str) -> str:
         return os.path.normcase(os.path.join(*a))
 
-    # Map normalized roots to their original casing
-    potential_roots: dict[str, str] = {}
-    covered_cache: dict[str, bool] = {}
-
-    for path in sorted(paths, key=len):
-        norm_path = os.path.normcase(path)
-        norm_dir = os.path.dirname(norm_path)
-
-        # We do _not_ add the files within wildcard paths.
-        # To speed up whether a file is within a wildcard, we break the
-        # path up into components and cache the answer so other files can
-        # take advantage of the lookup.
-        is_covered = covered_cache.get(norm_dir)
-        if is_covered is None:
-            # Only do the expensive walk if the cache misses
-            curr = norm_dir
-            is_covered = False
-            while curr:
-                w_key = curr if curr.endswith(os.sep) else curr + os.sep
-                if w_key in wildcards:
-                    is_covered = True
-                    break
-                parent = os.path.dirname(curr)
-                if parent == curr:
-                    break
-                curr = parent
-            covered_cache[norm_dir] = is_covered
-
-        if is_covered:
+    for root in unchecked:
+        if any(os.path.normcase(root).startswith(w) for w in wildcards):
+            # This directory has already been handled.
             continue
 
-        try:
-            if stat.S_ISDIR(os.stat(path, follow_symlinks=False).st_mode):
-                w_key = norm_path if norm_path.endswith(os.sep) else norm_path + os.sep
-                w_orig = path if path.endswith(os.sep) else path + os.sep
-                wildcards[w_key] = w_orig
-                potential_roots[w_key] = w_orig
-                covered_cache[norm_path] = True
-                continue
-        except OSError:
-            continue
+        all_files: set[str] = set()
+        all_subdirs: set[str] = set()
+        for dirname, subdirs, files in os.walk(root):
+            all_subdirs.update(norm_join(root, dirname, d) for d in subdirs)
+            all_files.update(norm_join(root, dirname, f) for f in files)
+        # If all the files we found are in our remaining set of files to
+        # remove, then remove them from the latter set and add a wildcard
+        # for the directory.
+        if not (all_files - remaining):
+            remaining.difference_update(all_files)
+            wildcards.add(root + os.sep)
 
-        case_map[norm_path] = path
-        remaining.add(norm_path)
-        p_dir_norm = norm_dir if norm_dir.endswith(os.sep) else norm_dir + os.sep
-        if p_dir_norm not in potential_roots:
-            orig_dir = os.path.dirname(path)
-            p_dir_orig = orig_dir if orig_dir.endswith(os.sep) else orig_dir + os.sep
-            potential_roots[p_dir_norm] = p_dir_orig
-
-    # Outside of the initial pass, all data should be in a known format
-
-    # We want to identify the top most unique candidate directories so that we
-    # only process a directory and its children once
-    roots: list[str] = []
-    # root_candidates = potential_roots.copy()
-    # # keep the install prefix out of the potential roots since they are specifically
-    # # derived from the entries, however, we want the install location so we can
-    # # determine the actual installation root and parent namespace directories.
-    # if dist and dist.installed_location:
-    #     install_path = os.path.join(dist.installed_location, "")
-    #     root_candidates.update({install_path: install_path})
-    # for candidate in sorted(root_candidates, key=len):
-    #     if not any(candidate.startswith(os.path.normcase(r)) for r in roots):
-    #         roots.append(root_candidates[candidate])
-
-    root_candidates = potential_roots.copy()
-
-    # Safely normalize and format the preserved roots, injecting them into candidates
-    # if self._preserved_roots:
-    #     for reserved in self._preserved_roots:
-    #         install_path = os.path.join(reserved, "")
-    #         root_candidates[os.path.normcase(install_path)] = install_path
-
-    if dist and dist.installed_location:
-        install_path = os.path.join(dist.installed_location, "")
-        root_candidates.update({install_path: install_path})
-    # Sort ALPHABETICALLY by normalized path string keys
-    sorted_candidates = sorted(root_candidates.keys())
-
-    # Because it's normalized and sorted, children *must* come after parents
-    current_root_norm = sorted_candidates[0]
-    roots.append(root_candidates[current_root_norm])
-
-    for candidate_norm in sorted_candidates[1:]:
-        # If the next path starts with our current active root, it's a child. Skip it.
-        if candidate_norm.startswith(current_root_norm):
-            continue
-
-        # We found a completely new branch namespace
-        current_root_norm = candidate_norm
-        roots.append(root_candidates[current_root_norm])
-
-    # a list of all directories we may own
-    owned_paths: set[str] = set()
-    # for rs_norm in potential_roots:
-    #     for r_orig in roots:
-    #         r_norm = os.path.normcase(r_orig)
-
-    #         if rs_norm.startswith(r_norm):
-    #             # Calculate the lineage segments
-    #             tail = rs_norm[len(r_norm) :]
-
-    #             current = r_norm
-    #             owned_paths.add(current)
-
-    #             if tail:
-    #                 parts = [p for p in tail.split(os.sep) if p]
-    #                 for part in parts:
-    #                     current = current + part + os.sep
-    #                     owned_paths.add(current)
-    #             break
-
-    norm_roots_set = {os.path.normcase(r) for r in roots}
-
-    # Walk backwards up the directory string tree for each potential root
-    for rs_norm in potential_roots:
-        curr = rs_norm
-        lineage = []
-
-        while curr:
-            lineage.append(curr)
-
-            # If we hit an official root, we own this entire gathered line
-            if curr in norm_roots_set:
-                owned_paths.update(lineage)
-                break
-
-            # Pop off the last folder segment
-            parent = os.path.dirname(curr.rstrip(os.sep))
-            parent_slashed = parent if parent.endswith(os.sep) else parent + os.sep
-
-            # Safeguard: if we hit the filesystem root, stop
-            # This should never happen since roots are derived from potential roots
-            if parent_slashed == curr:
-                break
-            curr = parent_slashed
-
-    final_wildcards: dict[str, str] = wildcards.copy()
-
-    for root_orig in roots:
-        # Map to track if a directory's children poisoned it
-        # key: norm_dir, value: bool (is_poisoned)
-        poison_registry: dict[str, bool] = {}
-
-        # Track files found to handle the O(1) removal logic
-        # key: norm_dir, value: set of files
-        found_files_map: dict[str, set[str]] = {}
-
-        stack = [(root_orig, 0)]
-
-        while stack:
-            curr_orig, state = stack.pop()
-            norm_dir = norm_join(curr_orig, "")
-
-            if state == 0:
-                # --- STATE 0: ENTERING ---
-                if norm_dir in wildcards:
-                    continue
-
-                try:
-                    entries = list(os.scandir(curr_orig))
-                except OSError:
-                    poison_registry[norm_dir] = True
-                    continue
-
-                # Push self back with State 1 (to be processed AFTER children)
-                stack.append((curr_orig, 1))
-                found_files_map[norm_dir] = set()
-                poison_registry[norm_dir] = False  # Assume clean until proven otherwise
-
-                for entry in entries:
-                    e_norm = os.path.normcase(entry.path)
-                    if entry.is_dir(follow_symlinks=False):
-                        e_slashed = e_norm + os.sep
-                        # if e_slashed in final_wildcards:
-                        #     continue
-                        if e_slashed in owned_paths:
-                            # Push child to be visited
-                            stack.append((entry.path, 0))
-                        else:
-                            poison_registry[norm_dir] = True
-                    else:
-                        if e_norm in remaining:
-                            found_files_map[norm_dir].add(e_norm)
-                        else:
-                            poison_registry[norm_dir] = True
-
-            else:
-                # --- STATE 1: LEAVING (The Collapse Decision) ---
-                # is_root = os.path.normcase(curr_orig) == os.path.normcase(root_orig)
-                # Check if we were poisoned by a foreign file or an un-collapsible child
-                protected = (
-                    dist
-                    and dist.installed_location
-                    and norm_join(dist.installed_location, "") == norm_dir
-                )
-                if poison_registry[norm_dir] or protected:  # or is_root:
-                    # Bubble poison up to parent
-                    parent_dir = norm_join(
-                        os.path.dirname(curr_orig.rstrip(os.sep)), ""
-                    )
-                    if parent_dir in poison_registry:
-                        poison_registry[parent_dir] = True
-                    continue
-
-                # Success! Collapse this directory
-                final_wildcards[norm_dir] = os.path.join(curr_orig, "")
-
-                # remove files we actually found via disk
-                remaining.difference_update(found_files_map[norm_dir])
-                # and now delete any entries from remaining that we expected but
-                # didn't find because they may have been deleted otherwise
-                expected_here = {
-                    f
-                    for f in remaining
-                    if f.startswith(norm_dir) and os.sep not in f[len(norm_dir) :]
-                }
-                remaining.difference_update(expected_here)
-
-    # for w in sorted(wildcards, key=len):
-    #     orig_w = wildcards[w]
-    #     if not any(w.startswith(os.path.normcase(fw)) for fw in final_wildcards):
-    #         final_wildcards.add(orig_w)
-
-    return {case_map[p] for p in remaining} | set(final_wildcards.values())
+    return set(map(case_map.__getitem__, remaining)) | wildcards
 
 
 def compress_for_output_listing(paths: Iterable[str]) -> tuple[set[str], set[str]]:
