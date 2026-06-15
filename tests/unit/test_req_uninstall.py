@@ -167,7 +167,7 @@ def test_compressed_listing(tmpdir: Path) -> None:
     )
 
     will_remove, will_skip = compress_for_output_listing(sample)
-    will_rename = compress_for_rename(sample, mock_dist)
+    will_rename = compress_for_rename(sample)
     assert sorted(expected_skip) == sorted(compact(will_skip))
     assert sorted(expected_remove) == sorted(compact(will_remove))
     assert sorted(expected_rename) == sorted(compact(will_rename))
